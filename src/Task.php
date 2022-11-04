@@ -4,122 +4,330 @@ declare(strict_types=1);
 
 namespace Bic\Async;
 
-final class Task
+use Bic\Async\Task\FiberTask;
+use Bic\Async\Task\GeneratorTask;
+
+/**
+ * @template TReturn of mixed
+ * @template TSend of mixed
+ * @template TValue of mixed
+ *
+ * @template-implements TaskInterface<TReturn, TSend, TValue>
+ * @template-implements \IteratorAggregate<array-key, TValue>
+ */
+abstract class Task implements TaskInterface, \IteratorAggregate
 {
     /**
-     * @template TReturn of mixed
+     * @param \Generator|\Fiber|callable $task
      *
-     * @param ( array<\Generator<mixed, mixed, TReturn, mixed>>
-     *        | array<\Fiber<mixed, mixed, TReturn, mixed>>
-     *        | callable(mixed):TReturn
-     *        ) $tasks
-     *
-     * @return array<TReturn>
+     * @return static
+     * @throws \ReflectionException
      * @throws \Throwable
      */
-    public static function all(iterable $tasks): array
+    public static function new(\Generator|\Fiber|callable $task): static
     {
-        $coroutines = $result = [];
+        return match (true) {
+            \is_callable($task) => (new \ReflectionFunction($task(...)))->isGenerator()
+                ? static::fromGenerator($task)
+                : static::fromFiber($task),
+            $task instanceof \Generator => self::fromGenerator($task),
+            $task instanceof \Fiber => self::fromFiber($task),
+        };
+    }
 
-        foreach ($tasks as $index => $task) {
-            $result[$index] = null;
-            $coroutines[$index] = match (true) {
-                $task instanceof \Generator => $task,
-                $task instanceof \Fiber => self::fiberToCoroutine($task),
-                \is_callable($task) => self::async($task),
-                default => throw new \InvalidArgumentException('Invalid task type ' . \get_debug_type($task)),
-            };
+    /**
+     * @template TArgReturn of mixed
+     * @template TArgSend of mixed
+     * @template TArgValue of mixed
+     *
+     * @psalm-type TArgGenerator = \Generator<array-key, TArgSend, TArgReturn, TArgValue>
+     *
+     * @psalm-param TArgGenerator|callable():TArgGenerator $coroutine
+     *
+     * @return static<TArgReturn, TArgSend, TArgValue>
+     */
+    public static function fromGenerator(\Generator|callable $coroutine): static
+    {
+        if (!$coroutine instanceof \Generator) {
+            $coroutine = $coroutine();
+
+            if (!$coroutine instanceof \Generator) {
+                $message = 'Argument #1 ($coroutine) must be of type '
+                         . 'callable():Generator, callable():%s given';
+
+                throw new \InvalidArgumentException(\sprintf($message, \get_debug_type($coroutine)));
+            }
         }
 
+        return new GeneratorTask($coroutine);
+    }
+
+    /**
+     * @param \Fiber|callable $fiber
+     *
+     * @return static
+     * @throws \Throwable
+     */
+    public static function fromFiber(\Fiber|callable $fiber): static
+    {
+        if (!$fiber instanceof \Fiber) {
+            $fiber = new \Fiber($fiber);
+        }
+
+        return new FiberTask($fiber);
+    }
+
+    /**
+     * @return \Generator<array-key, TSend, TReturn, TValue>
+     */
+    public function getGenerator(): \Generator
+    {
+        while (!$this->isCompleted()) {
+            $send = yield $this->current();
+
+            $this->resume($send);
+        }
+
+        return $this->getResult();
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getFiber(): \Fiber
+    {
+        return new \Fiber(function (): mixed {
+            while (!$this->isCompleted()) {
+                $next = \Fiber::suspend($this->current());
+
+                $this->resume($next);
+            }
+
+            return $this->getResult();
+        });
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getIterator(): \Traversable
+    {
+        return $this->getGenerator();
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function wait(): mixed
+    {
         if (\Fiber::getCurrent()) {
-            while ($coroutines !== []) {
-                foreach ($coroutines as $index => $coroutine) {
-                    if (!$coroutine->valid()) {
-                        $result[$index] = $coroutine->getReturn();
-                        unset($coroutines[$index]);
+            while (!$this->isCompleted()) {
+                $value = \Fiber::suspend($this->current());
+
+                $this->resume($value);
+            }
+        } else {
+            while (!$this->isCompleted()) {
+                $this->resume();
+            }
+        }
+
+        return $this->getResult();
+    }
+
+    /**
+     * @template TArgReturn of mixed
+     * @template TArgSend of mixed
+     * @template TArgValue of mixed
+     *
+     * @param non-empty-list<TaskInterface<TArgReturn, TArgSend, TArgValue>> $tasks
+     *
+     * @return array<TArgReturn>
+     */
+    public static function waitAll(iterable $tasks): array
+    {
+        return self::all($tasks)->wait();
+    }
+
+    /**
+     * The {@see all()} method takes an iterable of {@see TaskInterface} as
+     * input and returns a single {@see TaskInterface}.
+     *
+     * This returned {@see TaskInterface} returns result when all of the input's
+     * {@see TaskInterface} (including when an empty iterable is passed), with
+     * an array of the returned values. It throws an error when any of the
+     * input's {@see TaskInterface} fails, with this first {@see \Throwable}.
+     *
+     * @template TArgReturn of mixed
+     * @template TArgSend of mixed
+     * @template TArgValue of mixed
+     *
+     * @param non-empty-list<TaskInterface<TArgReturn, TArgSend, TArgValue>> $tasks
+     *
+     * @return TaskInterface<array<TArgReturn>, TArgSend, TArgValue>
+     */
+    public static function all(iterable $tasks): TaskInterface
+    {
+        $tasks = [...$tasks];
+
+        return Task::fromGenerator(function () use ($tasks) {
+            $result = [];
+
+            while ($tasks !== []) {
+                foreach ($tasks as $index => $task) {
+                    if ($task->isCompleted()) {
+                        $result[$index] = $task->getResult();
+                        unset($tasks[$index]);
                         continue;
                     }
 
-                    $send = \Fiber::suspend($coroutine->current());
-
-                    $coroutine->send($send);
+                    $task->resume(yield $task->current());
                 }
             }
-        }
 
-        while ($coroutines !== []) {
-            foreach ($coroutines as $index => $coroutine) {
-                if (!$coroutine->valid()) {
-                    $result[$index] = $coroutine->getReturn();
-                    unset($coroutines[$index]);
-                    continue;
-                }
+            \ksort($result);
 
-                $coroutine->next();
-            }
-        }
-
-        return $result;
+            return $result;
+        });
     }
 
     /**
-     * @template TStart
-     * @template TResume
-     * @template TReturn
-     * @template TSuspend
+     * @template TArgReturn of mixed
+     * @template TArgSend of mixed
+     * @template TArgValue of mixed
      *
-     * @param \Fiber<TStart, TResume, TReturn, TSuspend> $fiber
-     * @param TStart ...$args
-     * @return \Generator<array-key, TResume, TReturn, TSuspend>
-     * @throws \Throwable
+     * @param non-empty-list<TaskInterface<TArgReturn, TArgSend, TArgValue>> $tasks
+     * @param positive-int $count
+     *
+     * @return array<TArgReturn>
      */
-    public static function fiberToCoroutine(\Fiber $fiber, mixed ...$args): \Generator
+    public static function waitSome(iterable $tasks, int $count = 1): mixed
     {
-        $index = -1; // Note: Pre-increment is faster than post-increment.
-        $value = null;
+        return self::some($tasks, $count)->wait();
+    }
 
-        // Allow an already running fiber.
-        if (!$fiber->isStarted()) {
-            $value = $fiber->start(...$args);
+    /**
+     * @template TArgReturn of mixed
+     * @template TArgSend of mixed
+     * @template TArgValue of mixed
+     *
+     * @param non-empty-list<TaskInterface<TArgReturn, TArgSend, TArgValue>> $tasks
+     * @param positive-int $count
+     *
+     * @return TaskInterface<array<TArgReturn>, TArgSend, TArgValue>
+     */
+    public static function some(iterable $tasks, int $count = 1): TaskInterface
+    {
+        $tasks = [...$tasks];
 
-            if (!$fiber->isTerminated()) {
-                $value = yield ++$index => $value;
+        return Task::fromGenerator(function () use ($count, $tasks) {
+            $result = [];
+
+            while ($tasks !== [] && $count > 0) {
+                foreach ($tasks as $index => $task) {
+                    if ($task->isCompleted()) {
+                        $result[$index] = $task->getResult();
+                        unset($tasks[$index]);
+                        continue;
+                    }
+
+                    $task->resume(yield $task->current());
+                }
             }
-        }
 
-        // A Fiber without suspends should return the result immediately.
-        if (!$fiber->isTerminated()) {
+            \ksort($result);
+
+            return $result;
+        });
+    }
+
+    /**
+     * @template TArgReturn of mixed
+     * @template TArgSend of mixed
+     * @template TArgValue of mixed
+     *
+     * @param non-empty-list<TaskInterface<TArgReturn, TArgSend, TArgValue>> $tasks
+     *
+     * @return TArgReturn
+     */
+    public static function waitAny(iterable $tasks): mixed
+    {
+        return self::any($tasks)->wait();
+    }
+
+    /**
+     * @template TArgReturn of mixed
+     * @template TArgSend of mixed
+     * @template TArgValue of mixed
+     *
+     * @param non-empty-list<TaskInterface<TArgReturn, TArgSend, TArgValue>> $tasks
+     *
+     * @return TaskInterface<TArgReturn, TArgSend, TArgValue>
+     */
+    public static function any(iterable $tasks): TaskInterface
+    {
+        $tasks = [...$tasks];
+
+        return Task::fromGenerator(function () use ($tasks) {
             while (true) {
-                $value = $fiber->resume($value);
+                foreach ($tasks as $task) {
+                    if ($task->isCompleted()) {
+                        return $task->getResult();
+                    }
 
-                // The last call to "resume()" moves the execution of the
-                // Fiber to the "return" stmt.
-                //
-                // So the "yield" is not needed. Skip this step and return
-                // the result.
-                if ($fiber->isTerminated()) {
-                    break;
+                    $task->resume(yield $task->current());
                 }
-
-                $value = yield ++$index => $value;
             }
-        }
-
-        return $fiber->getReturn();
+        });
     }
 
     /**
-     * @template TReturn of mixed
-     * @template TArg of mixed
+     * @template TArgReturn of mixed
+     * @template TArgSend of mixed
+     * @template TArgValue of mixed
      *
-     * @param callable(TArg):TReturn $task
-     * @param TArg ...$args
+     * @param non-empty-list<TaskInterface<TArgReturn, TArgSend, TArgValue>> $tasks
      *
-     * @return \Generator<mixed, mixed, TReturn, mixed>
-     * @throws \Throwable
+     * @return TArgReturn
      */
-    public static function async(callable $task, mixed ...$args): \Generator
+    public static function waitRace(iterable $tasks): mixed
     {
-        return self::fiberToCoroutine(new \Fiber($task), ...$args);
+        return self::race($tasks)->wait();
+    }
+
+    /**
+     * @template TArgReturn of mixed
+     * @template TArgSend of mixed
+     * @template TArgValue of mixed
+     *
+     * @param non-empty-list<TaskInterface<TArgReturn, TArgSend, TArgValue>> $tasks
+     *
+     * @return TaskInterface<TArgReturn, TArgSend, TArgValue>
+     */
+    public static function race(iterable $tasks): TaskInterface
+    {
+        $tasks = [...$tasks];
+
+        return Task::fromGenerator(function () use ($tasks) {
+            [$completed, $result] = [false, null];
+
+            while ($tasks !== []) {
+                foreach ($tasks as $index => $task) {
+                    if ($task->isCompleted()) {
+                        if ($completed === false) {
+                            $result = $task->getResult();
+                            $completed = true;
+                        }
+
+                        unset($tasks[$index]);
+                        continue;
+                    }
+
+                    $task->resume(yield $task->current());
+                }
+            }
+
+            return $result;
+        });
     }
 }
