@@ -73,6 +73,8 @@ final class Loop implements LoopInterface
                     $task->throw($e);
                 }
             }
+
+            \usleep(1);
         }
 
         return true;
